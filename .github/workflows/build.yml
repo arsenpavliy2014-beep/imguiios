@@ -1,0 +1,69 @@
+name: Build ImGui for iOS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install ant
+        run: brew install ant
+
+      - name: Clone imgui-java 1.90.0
+        run: |
+          git clone --recursive https://github.com/SpaiR/imgui-java.git
+          cd imgui-java
+          git checkout v1.90.0 || git checkout 1.90.0 || echo "tag not found, using default branch"
+          git submodule update --init --recursive
+
+      - name: Step 1 - generate JNI sources and build for macOS
+        continue-on-error: true
+        working-directory: imgui-java
+        run: ./gradlew :imgui-binding:generateLibs -Denvs=macosarm64 -Dlocal --no-daemon 2>&1 | tee ../gen.log
+
+      - name: Step 2 - rebuild the same sources for iOS
+        continue-on-error: true
+        run: |
+          cd imgui-java
+          XML=$(find . -name "build-macosxarm64.xml" | head -1)
+          echo "build file: $XML"
+          [ -n "$XML" ] || exit 1
+          DIR=$(dirname "$XML")
+          NAME=$(basename "$XML")
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "iOS SDK: $SDK"
+          cp "$XML" "$XML.orig"
+          sed -i '' -E "s#-mmacosx-version-min=[0-9.]+#-miphoneos-version-min=14.0 -isysroot $SDK#g" "$XML"
+          touch "$XML"
+          cd "$DIR"
+          ant -f "$NAME" -v 2>&1 | tee ../../../ios-build.log
+
+      - name: Collect results
+        if: always()
+        run: |
+          mkdir -p out
+          cd imgui-java
+          find . \( -name "*.dylib" -o -name "build-macosx*.xml*" \) -not -path "*/node_modules/*" > ../out/files.txt || true
+          for f in $(find . -name "build-macosxarm64.xml*"); do cp "$f" "../out/$(basename $f)"; done
+          cd ..
+          cp gen.log out/ || true
+          cp ios-build.log out/ || true
+          for f in $(find imgui-java -name "libimgui-java64.dylib" -newer imgui-java/README.md); do
+            echo "== $f" >> out/platform.txt
+            lipo -info "$f" >> out/platform.txt 2>&1 || true
+            vtool -show-build "$f" >> out/platform.txt 2>&1 || true
+            cp "$f" out/libimgui-java64.dylib
+          done
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: imgui-ios
+          path: out/
