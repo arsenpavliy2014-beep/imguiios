@@ -19,48 +19,64 @@ jobs:
         run: |
           git clone --recursive https://github.com/SpaiR/imgui-java.git
           cd imgui-java
-          git checkout v1.90.0 || git checkout 1.90.0 || echo "tag not found, using default branch"
+          git checkout 1.90.0 || echo "tag not found, using default branch"
           git submodule update --init --recursive
+          git log -1 --oneline
 
-      - name: Step 1 - generate JNI sources and build for macOS
-        continue-on-error: true
+      - name: Generate JNI sources
         working-directory: imgui-java
-        run: ./gradlew :imgui-binding:generateLibs -Denvs=macosarm64 -Dlocal --no-daemon 2>&1 | tee ../gen.log
+        run: ./gradlew :imgui-binding:generateLibs -Denvs=macosarm64 -Dlocal --no-daemon --console=plain
 
-      - name: Step 2 - rebuild the same sources for iOS
-        continue-on-error: true
+      - name: Build iOS dylib
         run: |
-          cd imgui-java
-          XML=$(find . -name "build-macosxarm64.xml" | head -1)
-          echo "build file: $XML"
-          [ -n "$XML" ] || exit 1
-          DIR=$(dirname "$XML")
-          NAME=$(basename "$XML")
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          echo "iOS SDK: $SDK"
-          cp "$XML" "$XML.orig"
-          sed -i '' -E "s#-mmacosx-version-min=[0-9.]+#-miphoneos-version-min=14.0 -isysroot $SDK#g" "$XML"
-          touch "$XML"
-          cd "$DIR"
-          ant -f "$NAME" -v 2>&1 | tee ../../../ios-build.log
+          set -o pipefail
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          LOG="$GITHUB_WORKSPACE/out/ios-build.log"
 
-      - name: Collect results
+          # 1. remove the macOS dylib produced by the generate step
+          find "$GITHUB_WORKSPACE/imgui-java" -name "libimgui-java64.dylib" -print -delete
+
+          # 2. find the generated Ant script
+          XML=$(find "$GITHUB_WORKSPACE/imgui-java/imgui-binding/build/jni" -maxdepth 1 -name "build-macosxarm64.xml" | head -1)
+          echo "XML=$XML"
+          test -n "$XML"
+          cp "$XML" "$GITHUB_WORKSPACE/out/build-macosxarm64.xml.orig"
+
+          # 3. point compiler/linker flags at the iPhoneOS SDK
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK"
+          python3 - "$XML" "$SDK" <<'PY'
+          import sys, re
+          path, sdk = sys.argv[1], sys.argv[2]
+          t = open(path, encoding='utf-8', errors='surrogateescape').read()
+          t = re.sub(r'-mmacosx-version-min=[0-9.]+', '', t)
+          flags = f'-target arm64-apple-ios14.0 -isysroot {sdk}'
+          t, n = re.subn(r'-arch arm64', f'-arch arm64 {flags}', t)
+          print('patched places:', n)
+          open(path, 'w', encoding='utf-8', errors='surrogateescape').write(t)
+          PY
+          cp "$XML" "$GITHUB_WORKSPACE/out/build-macosxarm64.xml"
+
+          # 4. build with the patched script
+          cd "$(dirname "$XML")"
+          ant -f "$(basename "$XML")" -v -Dhas-compiler=true -Drelease=true clean postcompile 2>&1 | tee "$LOG"
+
+          # 5. verify: must be iOS, arm64 only
+          DYLIB=$(find "$GITHUB_WORKSPACE/imgui-java" -name "libimgui-java64.dylib" -newer "$XML.orig" | head -1)
+          echo "DYLIB=$DYLIB"
+          test -n "$DYLIB"
+          lipo -info "$DYLIB" | tee "$GITHUB_WORKSPACE/out/platform.txt"
+          otool -l "$DYLIB" | grep -A4 LC_BUILD_VERSION | tee -a "$GITHUB_WORKSPACE/out/platform.txt"
+          otool -l "$DYLIB" | grep -q "platform 2" || { echo "NOT an iOS build (platform 2 missing)"; exit 1; }
+          cp "$DYLIB" "$GITHUB_WORKSPACE/out/libimgui-java64.dylib"
+
+      - name: Collect logs
         if: always()
         run: |
-          mkdir -p out
-          cd imgui-java
-          find . \( -name "*.dylib" -o -name "build-macosx*.xml*" \) -not -path "*/node_modules/*" > ../out/files.txt || true
-          for f in $(find . -name "build-macosxarm64.xml*"); do cp "$f" "../out/$(basename $f)"; done
-          cd ..
-          cp gen.log out/ || true
-          cp ios-build.log out/ || true
-          for f in $(find imgui-java -name "libimgui-java64.dylib" -newer imgui-java/README.md); do
-            echo "== $f" >> out/platform.txt
-            lipo -info "$f" >> out/platform.txt 2>&1 || true
-            vtool -show-build "$f" >> out/platform.txt 2>&1 || true
-            cp "$f" out/libimgui-java64.dylib
-          done
-          ls -la out
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$GITHUB_WORKSPACE/imgui-java/imgui-binding/build/jni/build-macosxarm64.xml" "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE/imgui-java/imgui-binding/build/jni/build-macosxarm64.xml.orig" "$GITHUB_WORKSPACE/out/" 2>/dev/null || true
+          ls -la "$GITHUB_WORKSPACE/out"
 
       - uses: actions/upload-artifact@v4
         if: always()
